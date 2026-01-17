@@ -1,278 +1,199 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
+import sys
 import os
+import csv
 import datetime
-import random
-import glob
-from collections import deque
-from treys import Card, Evaluator, Deck
-from poker_headless import PokerEnv
+import pandas as pd
+import numpy as np
+from poker_gym import PokerTable, SmartBot, RandomBot, ManiacBot, CallingStationBot
 
-### --- CONFIGURATION --- ###
-PROJECT_ROOT = "/home/roman/github/Poker-AI"
-MODELS_ROOT = os.path.join(PROJECT_ROOT, "data", "models")
-TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-SAVE_DIR = os.path.join(MODELS_ROOT, f"rl_smart_{TIMESTAMP}")
-os.makedirs(SAVE_DIR, exist_ok=True)
+# CONFIGURATION
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+TRAIN_READY_DIR = os.path.join(DATA_DIR, "training_ready")
+SMART_PLAY_DIR = os.path.join(TRAIN_READY_DIR, "smart_play") 
+LOG_FILE = os.path.join(DATA_DIR, "train_smart_data.csv")
 
-# Training Hyperparameters
-TOTAL_EPISODES = 100000     
-TEST_INTERVAL = 1000        
-TEST_HANDS = 500            
-PATIENCE_LIMIT = 20         
+TOTAL_HANDS = 50000 
+BATCH_SIZE = 500 # Save parquet every 500 hands
 
-# RL Hyperparameters
-BATCH_SIZE = 64
-GAMMA = 0.99
-EPSILON_START = 0.5
-EPSILON_END = 0.05
-EPSILON_DECAY = 5000
-TARGET_UPDATE = 10
-MEMORY_SIZE = 10000
+# Ensure dirs exist
+if not os.path.exists(TRAIN_READY_DIR): os.makedirs(TRAIN_READY_DIR)
+if not os.path.exists(SMART_PLAY_DIR): os.makedirs(SMART_PLAY_DIR)
 
-### --- 1. THE BRAIN --- ###
-class PokerNet(nn.Module):
-    def __init__(self, input_size=21, num_classes=3):
-        super(PokerNet, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_size, 512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x):
-        return self.network(x)
-
-#### --- 2. REPLAY MEMORY --- ###
-class ReplayMemory:
-    def __init__(self, capacity):
-        self.memory = deque(maxlen=capacity)
-    def push(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
-    def __len__(self):
-        return len(self.memory)
-
-### --- 3. UTILS --- ###
-def get_state_vector(state_dict):
-    hole = state_dict.get('hole_cards', [])
-    board = state_dict.get('board_cards', [])
-    
-    def grs(c_int):
-        if c_int is None: return 0, 0
-        return Card.get_rank_int(c_int), Card.get_suit_int(c_int)
-
-    h_r1, h_s1 = grs(hole[0] if len(hole)>0 else None)
-    h_r2, h_s2 = grs(hole[1] if len(hole)>1 else None)
-    
-    b_feats = []
-    for i in range(5):
-        c = board[i] if i < len(board) else None
-        r, s = grs(c)
-        b_feats.extend([r,s])
-
-    vec = [
-        state_dict.get('pot_odds', 0),
-        state_dict.get('spr', 0),
-        state_dict.get('position', 0.5),
-        state_dict.get('street', 0),
-        state_dict.get('current_pot', 0),
-        state_dict.get('to_call', 0),
-        state_dict.get('has_pair', 0),
-        h_r1, h_s1, h_r2, h_s2,
-        *b_feats
-    ]
-    return np.array(vec, dtype=np.float32)
-
-### --- 4. VALIDATION FUNCTION --- ###
-def run_validation(policy_net, device):
-    """Runs a quick Gauntlet without training to measure skill"""
-    evaluator = Evaluator()
-    chips_won = 0
-    wins = 0
-    hands = 0
-    big_blind = 100
-    
-    policy_net.eval()
-    
-    for _ in range(TEST_HANDS):
-        deck = Deck()
-        hero_hand = deck.draw(2)
-        villain_hand = deck.draw(2)
-        board = deck.draw(5)
+# 1. HUMAN LOGGING (CSV - For Dashboard)
+class SmartRecorder:
+    def __init__(self, filename=LOG_FILE):
+        if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
+        self.filepath = filename
         
-        current_board = board[:3]
-        pot = big_blind * 2
+        base_headers = ["Hand_ID", "Timestamp", "Winner", "Pot_Size", "Winning_Rank", "Board", "Showdown_Hands"]
+        player_headers = []
+        for i in range(1, 7): 
+            p = f"P{i}"
+            player_headers.extend([f"{p}_Name", f"{p}_Stack", f"{p}_Net", f"{p}_BuyIns"])
+        self.headers = base_headers + player_headers
+
+        if not os.path.exists(self.filepath):
+            with open(self.filepath, mode='w', newline='') as f:
+                csv.writer(f).writerow(self.headers)
+
+    def save_snapshot(self, hand_id, raw_string):
+        try:
+            parts = raw_string.split('^')
+            if len(parts) < 6: return
+
+            row = [hand_id, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+            row.extend(parts[0:5])
+            
+            stats_str = parts[5]
+            if stats_str:
+                all_players = stats_str.split(" || ")
+                for p_str in all_players:
+                    p_parts = p_str.split('|')
+                    if len(p_parts) == 4: row.extend(p_parts)
+                    else: row.extend(["N/A", 0, 0, 0])
+
+            while len(row) < len(self.headers): row.append("")
+            with open(self.filepath, mode='a', newline='') as f:
+                csv.writer(f).writerow(row)
+        except Exception: pass
+
+class HeadlessLogger:
+    def __init__(self, recorder, original_stdout):
+        self.recorder = recorder
+        self.terminal = original_stdout
+        self.hand_counter = 0
+
+    def write(self, message):
+
+        # 1. CAPTURE DATA (Goes to File, NOT Screen)
+        if "[CSV_DATA] HAND" in message:
+            clean_msg = message.replace("[CSV_DATA] HAND^", "").strip()
+            self.recorder.save_snapshot(self.hand_counter, clean_msg)
+            self.hand_counter += 1
+            return
+
+        # 2. PRINT STATUS (Only print important updates)
+        if "Saving batch" in message or "Error" in message or "STARTING" in message:
+            self.terminal.write(message)
+            self.terminal.flush()
+
+    def flush(self): self.terminal.flush()
+
+# 2. AI MEMORY (Parquet - For Training)
+class MemoryBuffer:
+    def __init__(self):
+        self.current_hand_moves = {} 
+        self.collected_data = [] 
+
+    def record_move(self, player_name, state, action):
+        if player_name not in self.current_hand_moves:
+            self.current_hand_moves[player_name] = []
+        self.current_hand_moves[player_name].append((state, action))
+
+    def save_to_disk(self):
+        # 1. Initialize list
+        flat_data = []
         
-        state_dict = {
-            'hole_cards': hero_hand,
-            'board_cards': current_board,
-            'pot_odds': 0.33, 'spr': 5.0, 'position': 0.5, 'street': 3,
-            'current_pot': pot, 'to_call': 0, 'has_pair': 0
+        # 2. Flatten data
+        for p_name, moves in self.current_hand_moves.items():
+            for state, action in moves:
+                flat = {
+                    'pot_odds': state.get('to_call') / (state.get('pot') + state.get('to_call')) if (state.get('pot')+state.get('to_call')) > 0 else 0,
+                    'spr': state.get('stack') / state.get('pot') if state.get('pot') > 0 else 0,
+                    'position': 0.5,
+                    'street': state.get('street', 0),
+                    'current_pot': state.get('pot', 0),
+                    'to_call': state.get('to_call', 0),
+                    'target_action': action.upper()
+                }
+                
+                # Cards
+                from treys import Card
+                def grs(c): return (Card.get_rank_int(c), Card.get_suit_int(c)) if c else (0,0)
+                
+                hole = state.get('hole_cards', [])
+                flat['hole_rank_1'], flat['hole_suit_1'] = grs(hole[0] if len(hole)>0 else None)
+                flat['hole_rank_2'], flat['hole_suit_2'] = grs(hole[1] if len(hole)>1 else None)
+                
+                board = state.get('board_cards', [])
+                for i in range(5):
+                    r, s = grs(board[i] if len(board)>i else None)
+                    flat[f'board_rank_{i+1}'] = r
+                    flat[f'board_suit_{i+1}'] = s
+                
+                flat_data.append(flat)
+
+        # 3. Check if empty
+        if not flat_data: return
+        
+        # 4. Clear buffer
+        self.current_hand_moves = {}
+        
+        # 5. Save to Subfolder (Batch)
+        df = pd.DataFrame(flat_data)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = os.path.join(SMART_PLAY_DIR, f"smart_{timestamp}.parquet")
+        
+        try:
+            df.to_parquet(filename)
+        except: pass
+
+# 3. MAIN LOOP
+def train():
+    recorder = SmartRecorder()
+    original_stdout = sys.stdout
+    sys.stdout = HeadlessLogger(recorder, original_stdout)
+    
+    # Setup Parquet Memory
+    memory = MemoryBuffer()
+
+    print(f"--- STARTING GYM TRAINING (SILENT MODE) ---")
+    print(f"--- Saving CSV to: {LOG_FILE} ---")
+    print(f"--- Saving Parquet to: {SMART_PLAY_DIR} ---")
+
+    # Table Setup
+    hero = SmartBot("SmartBot_Gym")
+    
+    # Wrapper for Hero
+    original_action = hero.action
+    def recording_wrapper(current_table_bet, pot, community_cards, player=hero, og_act=original_action):
+        total_pot = pot + current_table_bet
+        to_call = current_table_bet - player.current_bet
+        state_snapshot = {
+            'pot': total_pot, 'to_call': to_call, 'stack': player.stack,
+            'street': len(community_cards), 'hole_cards': player.hand,
+            'board_cards': community_cards
         }
-        state_vec = get_state_vector(state_dict)
-        
-        with torch.no_grad():
-            t_state = torch.tensor(np.array([state_vec]), device=device)
-            output = policy_net(t_state)
-            action_idx = torch.argmax(output, dim=1).item()
-            
-        if action_idx == 0: 
-            chips_won -= 50
-        else:
-            h_score = evaluator.evaluate(board, hero_hand)
-            v_score = evaluator.evaluate(board, villain_hand)
-            if h_score < v_score:
-                chips_won += pot
-                wins += 1
-            else:
-                chips_won -= big_blind
-        hands += 1
-        
-    policy_net.train() 
-    bb_100 = (chips_won / big_blind) / (hands / 100)
-    return bb_100, wins
+        decision, amt = og_act(current_table_bet, pot, community_cards)
+        memory.record_move(player.name, state_snapshot, decision)
+        return decision, amt
+    hero.action = recording_wrapper
 
-### --- 5. MAIN LOOP --- ###
-def train_and_validate():
-    print(f"[INFO] Starting Smart Training (Early Stopping Enabled)")
-    print(f"[INFO] Output: {SAVE_DIR}")
+    opponents = [ManiacBot("Maniac"), RandomBot("Fish"), CallingStationBot("Station"), ManiacBot("Aggro")]
+    table = PokerTable([hero] + opponents)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    policy_net = PokerNet().to(device)
-    target_net = PokerNet().to(device)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
-    
-    optimizer = optim.Adam(policy_net.parameters(), lr=0.0001)
-    memory = ReplayMemory(MEMORY_SIZE)
-    
-    ### --- FIXED LOADING LOGIC --- ###
     try:
-        list_of_dirs = glob.glob(os.path.join(MODELS_ROOT, 'v_*')) + glob.glob(os.path.join(MODELS_ROOT, 'rl_*'))
-        latest_file = None
-
-        if list_of_dirs:
-            # Sort by modification time to find the newest folder
-            list_of_dirs.sort(key=os.path.getmtime, reverse=True)
+        # Loop in batches to save files regularly
+        hands_played = 0
+        while hands_played < TOTAL_HANDS:
             
-            for latest_dir in list_of_dirs:
-                # Try to find a valid model file in this directory
-                if "rl_" in latest_dir:
-                    files = glob.glob(os.path.join(latest_dir, "*.pth"))
-                    if files: 
-                        latest_file = max(files, key=os.path.getmtime)
-                        break # Found one, stop searching
-                else:
-                    temp_path = os.path.join(latest_dir, "poker_brain.pth")
-                    if os.path.exists(temp_path):
-                        latest_file = temp_path
-                        break # Found one, stop searching
-            
-            if latest_file and os.path.exists(latest_file):
-                policy_net.load_state_dict(torch.load(latest_file, map_location=device))
-                target_net.load_state_dict(policy_net.state_dict())
-                print(f"[INFO] Loaded Brain: {latest_file}")
-            else:
-                 print("[INFO] No valid .pth files found in recent folders. Starting fresh.")
-        else:
-            print("[INFO] No model directories found. Starting fresh.")
-
-    except Exception as e:
-        print(f"[WARN] Error during model loading (Starting fresh): {e}")
-    # ---------------------------
-
-    env = PokerEnv()
-    steps_done = 0
-    
-    best_winrate = -9999
-    patience_counter = 0
-    
-    for i_episode in range(1, TOTAL_EPISODES + 1):
-        state_dict = env.reset_game()
-        state = get_state_vector(state_dict)
-        done = False
-        
-        while not done:
-            sample = random.random()
-            eps_threshold = EPSILON_END + (EPSILON_START - EPSILON_END) * \
-                np.exp(-1. * steps_done / EPSILON_DECAY)
-            steps_done += 1
-            
-            if sample > eps_threshold:
-                with torch.no_grad():
-                    st_tensor = torch.tensor(np.array([state]), device=device)
-                    q_values = policy_net(st_tensor)
-                    action_idx = q_values.max(1)[1].item()
-            else:
-                action_idx = random.randrange(3)
-            
-            action_map = {0: 'fold', 1: 'call', 2: 'raise'}
-            cmd = action_map[action_idx]
-            
-            next_state_dict, reward, done = env.step(0, cmd)
-            next_state = get_state_vector(next_state_dict)
-            
-            memory.push(state, action_idx, reward, next_state, done)
-            state = next_state
-            
-            if len(memory) > BATCH_SIZE:
-                transitions = memory.sample(BATCH_SIZE)
-                batch_state, batch_action, batch_reward, batch_next, batch_done = zip(*transitions)
+            # Play a batch
+            for _ in range(BATCH_SIZE):
+                if hands_played >= TOTAL_HANDS: break
                 
-                b_state = torch.tensor(np.array(batch_state), device=device, dtype=torch.float32)
-                b_action = torch.tensor(batch_action, device=device, dtype=torch.long).unsqueeze(1)
-                b_reward = torch.tensor(batch_reward, device=device, dtype=torch.float32)
-                b_next = torch.tensor(np.array(batch_next), device=device, dtype=torch.float32)
-                
-                current_q = policy_net(b_state).gather(1, b_action)
-                next_q = target_net(b_next).max(1)[0].detach()
-                expected_q = b_reward + (GAMMA * next_q)
-                
-                loss = nn.SmoothL1Loss()(current_q, expected_q.unsqueeze(1))
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-        if i_episode % TARGET_UPDATE == 0:
-            target_net.load_state_dict(policy_net.state_dict())
+                for p in table.players:
+                    if p.stack <= 0: p.stack = 1000 
+                table.play_hand()
+                hands_played += 1
             
-        if i_episode % TEST_INTERVAL == 0:
-            print(f"\n[TEST] Validating at Episode {i_episode}...")
-            bb_100, wins = run_validation(policy_net, device)
+            # Save Batch
+            print(f" [Gym] Saving batch... ({hands_played}/{TOTAL_HANDS})")
+            memory.save_to_disk()
             
-            print(f"   Win Rate: {bb_100:+.2f} BB/100  (Wins: {wins}/{TEST_HANDS})")
-            
-            ckpt_path = os.path.join(SAVE_DIR, f"checkpoint_{i_episode}.pth")
-            torch.save(policy_net.state_dict(), ckpt_path)
-            
-            if bb_100 > best_winrate:
-                best_winrate = bb_100
-                patience_counter = 0 
-                
-                best_path = os.path.join(SAVE_DIR, "best_model.pth")
-                torch.save(policy_net.state_dict(), best_path)
-                print(f"   [NEW RECORD] Best model saved. Patience reset.")
-            else:
-                patience_counter += 1
-                print(f"   [STAGNATION] No improvement. Patience: {patience_counter}/{PATIENCE_LIMIT}")
-                
-            if patience_counter >= PATIENCE_LIMIT:
-                print(f"\n[STOP] Early Stopping triggered! No improvement for {PATIENCE_LIMIT} cycles.")
-                print(f"Best Win Rate achieved: {best_winrate:+.2f} BB/100")
-                break
-            
-            print(f"   Resuming training...")
+    except KeyboardInterrupt:
+        print("\n[STOP] User interrupted.")
+    finally:
+        sys.stdout = original_stdout
 
 if __name__ == "__main__":
-    train_and_validate()
+    train()

@@ -1,240 +1,155 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
+import pandas as pd
 import os
 import random
-from collections import deque
+import glob
+import time
 from treys import Card, Evaluator, Deck
+from train_models import PokerNet
 
-### --- CONFIGURATION --- ###
-PROJECT_ROOT = "/home/roman/github/Poker-AI"
-MODELS_ROOT = os.path.join(PROJECT_ROOT, "data", "models")
-CHAMPION_PATH = os.path.join(MODELS_ROOT, "league_champion.pth")
-SELF_PLAY_DIR = os.path.join(MODELS_ROOT, "self_play_evolution")
-os.makedirs(SELF_PLAY_DIR, exist_ok=True)
+# CONFIGURATION
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROSTER_DIR = os.path.join(PROJECT_ROOT, "data", "models", "active_roster")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "training_ready", "self_play")
+if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
 
-# Hyperparameters
-# Set to 5000 so the script finishes occasionally, allowing the League to run
-TOTAL_EPISODES = 5000 
-BATCH_SIZE = 64
-GAMMA = 0.99
-EPSILON_START = 0.3
-EPSILON_END = 0.05
-EPSILON_DECAY = 10000
-MEMORY_SIZE = 20000
-TARGET_UPDATE = 10
-OPPONENT_UPDATE = 1000
+# POKER CONSTANTS
+BIG_BLIND = 20
+START_STACK = 2000
 
-### --- 1. NETWORK --- ###
-class PokerNet(nn.Module):
-    def __init__(self, input_size=21, num_classes=3):
-        super(PokerNet, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_size, 512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x):
-        return self.network(x)
-
-### --- 2. SELF-PLAY ENVIRONMENT --- ###
-class SelfPlayEnv:
-    def __init__(self, opponent_model, device):
-        self.opponent = opponent_model
-        self.device = device
+class SelfPlayEngine:
+    def __init__(self):
         self.evaluator = Evaluator()
         self.deck = Deck()
+        self.opponents = self.load_roster()
         
-    def reset(self):
-        self.deck = Deck()
-        self.hero_hand = self.deck.draw(2)
-        self.villain_hand = self.deck.draw(2)
-        self.community_cards = []
-        self.pot = 150 # SB+BB
-        self.hero_stack = 10000 - 50 
-        self.villain_stack = 10000 - 100 
-        self.current_bet = 100
-        self.hero_bet = 50
-        self.villain_bet = 100
-        self.street = 0 
-        self.done = False
-        
-        return self.get_state_vector(is_hero=True)
+    def load_roster(self):
+        files = glob.glob(os.path.join(ROSTER_DIR, "*.pth"))
+        agents = []
+        if not files:
+            print("[WARN] No roster found. Creating random opponent.")
+            net = PokerNet()
+            agents.append(net)
+        else:
+            selected = random.sample(files, min(len(files), 5))
+            for f in selected:
+                net = PokerNet()
+                try:
+                    net.load_state_dict(torch.load(f, map_location='cpu'))
+                    net.eval()
+                    agents.append(net)
+                except: pass
+            print(f"[SELF-PLAY] Loaded {len(agents)} opponents.")
+        return agents
 
-    def get_state_vector(self, is_hero=True):
-        hand = self.hero_hand if is_hero else self.villain_hand
-        board = self.community_cards
-        
-        def grs(c_int):
-            if c_int is None: return 0, 0
-            return Card.get_rank_int(c_int), Card.get_suit_int(c_int)
-
-        h_r1, h_s1 = grs(hand[0])
-        h_r2, h_s2 = grs(hand[1])
+    def get_state_vector(self, hand, community, pot, to_call, stack):
+        def grs(c): return (Card.get_rank_int(c), Card.get_suit_int(c)) if c else (0,0)
+        h_r1, h_s1 = grs(hand[0]); h_r2, h_s2 = grs(hand[1])
         b_feats = []
         for i in range(5):
-            c = board[i] if i < len(board) else None
+            c = community[i] if i < len(community) else None
             r, s = grs(c)
             b_feats.extend([r, s])
-
-        my_bet = self.hero_bet if is_hero else self.villain_bet
-        to_call = self.current_bet - my_bet
-        stack = self.hero_stack if is_hero else self.villain_stack
-        
-        pot_odds = to_call / (self.pot + to_call) if (self.pot + to_call) > 0 else 0
-        spr = stack / self.pot if self.pot > 0 else 0
-        
-        vec = [
-            pot_odds, spr, 0.5, len(board), self.pot, to_call, 0,
-            h_r1, h_s1, h_r2, h_s2,
-            *b_feats
-        ]
+        pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0
+        spr = stack / pot if pot > 0 else 0
+        vec = [pot_odds, spr, 0.5, len(community), pot, to_call, 0,
+               h_r1, h_s1, h_r2, h_s2, *b_feats]
         return np.array(vec, dtype=np.float32)
 
-    def step(self, action_idx):
-        # HERO ACTION
-        if action_idx == 0: # FOLD
-            return self.get_state_vector(), -50, True 
-            
-        elif action_idx == 1: # CALL
-            to_call = self.current_bet - self.hero_bet
-            self.hero_stack -= to_call
-            self.hero_bet += to_call
-            self.pot += to_call
-            
-        elif action_idx == 2: # RAISE
-            raise_amt = (self.current_bet - self.hero_bet) + 100
-            self.hero_stack -= raise_amt
-            self.hero_bet += raise_amt
-            self.pot += raise_amt
-            self.current_bet = self.hero_bet
-
-        # VILLAIN ACTION (AI)
-        v_state = self.get_state_vector(is_hero=False)
-        with torch.no_grad():
-            t = torch.tensor(np.array([v_state]), device=self.device)
-            v_action = torch.argmax(self.opponent(t), dim=1).item()
-            
-        if v_action == 0: # Villain Folds
-            return self.get_state_vector(), self.pot, True 
-            
-        elif v_action == 2: # Villain Raises
-            to_call = (self.current_bet - self.villain_bet) + 100
-            self.villain_stack -= to_call
-            self.villain_bet += to_call
-            self.pot += to_call
-            self.current_bet = self.villain_bet
-            
-            # Hero forced Call to simplify training loop
-            hero_call = self.current_bet - self.hero_bet
-            self.hero_stack -= hero_call
-            self.pot += hero_call
-            
-        else: # Villain Calls
-            call_amt = self.current_bet - self.villain_bet
-            self.villain_stack -= call_amt
-            self.pot += call_amt
-
-        # NEXT STREET / SHOWDOWN
-        if self.street < 3:
-            self.street += 1
-            needed = [0, 3, 1, 1][self.street]
-            self.community_cards.extend(self.deck.draw(needed))
-            return self.get_state_vector(), 0, False
-        else:
-            h_score = self.evaluator.evaluate(self.community_cards, self.hero_hand)
-            v_score = self.evaluator.evaluate(self.community_cards, self.villain_hand)
-            
-            if h_score < v_score:
-                return self.get_state_vector(), self.pot, True
-            else:
-                return self.get_state_vector(), -self.pot, True
-
-### --- 3. TRAINING LOOP --- ###
-def train_self_play():
-    print(f"[INFO] Starting Self-Play (Hero vs Champion)")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    policy_net = PokerNet().to(device)
-    target_net = PokerNet().to(device)
-    opponent_net = PokerNet().to(device)
-    
-    if os.path.exists(CHAMPION_PATH):
-        print(f"[INFO] Loading Champion: {CHAMPION_PATH}")
-        weights = torch.load(CHAMPION_PATH, map_location=device)
-        policy_net.load_state_dict(weights)
-        target_net.load_state_dict(weights)
-        opponent_net.load_state_dict(weights)
-        opponent_net.eval()
-    else:
-        print("[ERR] No Champion found! Run train_models.py first.")
-        return
-
-    optimizer = optim.Adam(policy_net.parameters(), lr=0.0001)
-    memory = deque(maxlen=MEMORY_SIZE)
-    env = SelfPlayEnv(opponent_net, device)
-    
-    steps = 0
-    wins = 0
-    
-    for episode in range(TOTAL_EPISODES):
-        state = env.reset()
-        done = False
+    def play_batch(self, batch_size=5000):
+        data = []
         
-        while not done:
-            if random.random() > EPSILON_START:
-                with torch.no_grad():
-                    t = torch.tensor(np.array([state]), device=device)
-                    action = torch.argmax(policy_net(t), dim=1).item()
+        for _ in range(batch_size):
+            self.deck.shuffle()
+            hero_hand = self.deck.draw(2)
+            opp_hands = [self.deck.draw(2) for _ in self.opponents]
+            community = self.deck.draw(5) 
+            
+            # Setup Pot
+            pot = 30 # Small + Big Blind
+            hero_stack = START_STACK
+            to_call = 20
+            
+            # 1. STATE
+            state = self.get_state_vector(hero_hand, [], pot, to_call, hero_stack)
+            
+            # 2. ACTION (Hero picks a move)
+            if self.opponents:
+                hero_net = random.choice(self.opponents)
+                if random.random() < 0.20: # Exploration
+                    action = random.choice([0, 1, 2])
+                else:
+                    with torch.no_grad():
+                        state_tensor = torch.from_numpy(state).unsqueeze(0)
+                        action = torch.argmax(hero_net(state_tensor)).item()
             else:
-                action = random.randint(0, 2)
-            
-            next_state, reward, done = env.step(action)
-            memory.append((state, action, reward, next_state, done))
-            state = next_state
-            
-            if done and reward > 0: wins += 1
-            
-            if len(memory) > BATCH_SIZE:
-                batch = random.sample(memory, BATCH_SIZE)
-                b_state, b_action, b_reward, b_next, b_done = zip(*batch)
-                
-                b_state = torch.tensor(np.array(b_state), device=device, dtype=torch.float32)
-                b_action = torch.tensor(b_action, device=device, dtype=torch.long).unsqueeze(1)
-                b_reward = torch.tensor(b_reward, device=device, dtype=torch.float32)
-                b_next = torch.tensor(np.array(b_next), device=device, dtype=torch.float32)
-                
-                q_curr = policy_net(b_state).gather(1, b_action)
-                q_next = target_net(b_next).max(1)[0].detach()
-                q_targ = b_reward + (GAMMA * q_next)
-                
-                loss = nn.SmoothL1Loss()(q_curr, q_targ.unsqueeze(1))
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-        if episode % TARGET_UPDATE == 0:
-            target_net.load_state_dict(policy_net.state_dict())
-            
-        # EVOLUTION CHECKPOINT
-        if episode > 0 and episode % OPPONENT_UPDATE == 0:
-            new_champ = os.path.join(SELF_PLAY_DIR, f"evolution_{random.randint(1000,9999)}.pth")
-            torch.save(policy_net.state_dict(), new_champ)
-            print(f"[SAVE] New candidate saved: {new_champ}")
+                action = random.choice([0, 1, 2])
 
-    # Final Save
-    final_path = os.path.join(SELF_PLAY_DIR, f"evolution_final.pth")
-    torch.save(policy_net.state_dict(), final_path)
-    print("[INFO] Training Session Complete.")
+            # 3. CALCULATE PROFIT (BB/100 Logic)
+            # Simulate the hand result to see how many BBs we win or lose.
+            
+            hero_score = self.evaluator.evaluate(community, hero_hand)
+            opp_scores = [self.evaluator.evaluate(community, oh) for oh in opp_hands]
+            best_opp_score = min(opp_scores)
+            
+            did_win = hero_score < best_opp_score
+            
+            # BB PROFIT CALCULATION
+            # Fold: lose nothing (0 BB), or small blind if we posted it.
+            # Call/Raise and Lose: lose the bet amount (-BB).
+            # Call/Raise and Win: win the Pot (+BB).
+            
+            target_label = action 
+            
+            if action == 0: # FOLD
+                # Folding a winner = loss of opportunity cost
+                if did_win:
+                    # Lost the whole pot that could have been won
+                    profit_bb = - (pot / BIG_BLIND) 
+                    target_label = 2 # Should have Raised (Aggressive)
+                else:
+                    # Saving money = good fold
+                    profit_bb = 0.5 # Small reward for discipline
+                    target_label = 0
+            
+            elif action == 1: # CALL
+                if did_win:
+                    profit_bb = (pot / BIG_BLIND)
+                    target_label = 1
+                else:
+                    profit_bb = -1.0 # Lost 1 BB (the Call)
+                    target_label = 0 # Should have Folded
+            
+            elif action == 2: # RAISE
+                if did_win:
+                    # Large reward for building pot and winning
+                    profit_bb = (pot / BIG_BLIND) * 1.5 
+                    target_label = 2
+                else:
+                    # Expensive mistake.
+                    profit_bb = -2.0 # Lost 2 BB (the Raise)
+                    target_label = 0 # Should have Folded
+
+            # SAVE DATA
+            # Avoiding win/loss data and utilizing proft margin
+            # If the profit/loss impact was significant (> 0.5 BB), keep and learn from it.
+            if abs(profit_bb) >= 0.5:
+                row = list(state) + [target_label]
+                data.append(row)
+
+        # Save to Parquet
+        if not data: return
+        
+        cols = [f"f{i}" for i in range(21)] + ["target_action"]
+        df = pd.DataFrame(data, columns=cols)
+        
+        timestamp = int(time.time() * 1000)
+        filename = os.path.join(OUTPUT_DIR, f"self_play_{timestamp}.parquet")
+        df.to_parquet(filename)
+        
+        print(f"[GEN] Created {len(data)} hands (BB/100 Weighted).")
 
 if __name__ == "__main__":
-    train_self_play()
+    engine = SelfPlayEngine()
+    engine.play_batch()
